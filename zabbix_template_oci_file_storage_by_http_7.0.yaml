@@ -1,0 +1,2573 @@
+zabbix_export:
+  version: '7.0'
+  template_groups:
+  - uuid: c2c162144c2d4c5491c8801193af4945
+    name: Templates/Cloud
+  templates:
+  - uuid: 081a7961b58a4c3f8bd458920cad28f9
+    template: Oracle OCI File Storage by HTTP
+    name: Oracle OCI File Storage by HTTP
+    description: |
+      Enterprise zero-touch monitoring template for Oracle Cloud Infrastructure File Storage (FSS), Zabbix 7.0.
+
+      The template discovers File Systems and Mount Targets tenancy-wide in the configured OCI region through Resource Search. No compartment, File System OCID or Mount Target OCID list is required.
+
+      It collects:
+      - File System lifecycle, metered usage, FILE_SYSTEM_LEVEL hard/soft quotas, quota enforcement and violations, export paths, replication/snapshot/KMS metadata;
+      - File System read/write throughput, requests by size, read/write latency by size, metadata IOPS and metadata latency;
+      - Mount Target lifecycle, private IPs, NSGs, throughput shape, connections, read/write throughput and health;
+      - API collector health and errors.
+
+      Raw/API master items have history disabled; only normalized numeric and short metadata items are retained.
+
+      Authentication uses the same OCI request-signing macro names as the official Zabbix Oracle Cloud by HTTP template: {$OCI.API.TENANCY}, {$OCI.API.USER}, {$OCI.API.FINGERPRINT}, {$OCI.API.PRIVATE.KEY}.
+
+      Recommended OCI IAM policy for a dedicated Zabbix API user/group:
+        Allow group <ZabbixGroup> to read file-family in tenancy
+        Allow group <ZabbixGroup> to read metrics in tenancy
+        Allow group <ZabbixGroup> to read virtual-network-family in tenancy
+      The last line is needed only when {$OCI.FSS.RESOLVE.PRIVATE.IP}=1.
+
+      Default region is eu-milan-1 and can be changed once on the template/OCI host.
+    vendor:
+      name: Custom Enterprise
+      version: '1.0'
+    groups:
+    - name: Templates/Cloud
+    items:
+    - uuid: 1d8400d4e110471f963a1e282dc6175b
+      name: 'OCI FSS: Resource discovery raw'
+      type: SCRIPT
+      key: oci.fss.discovery.raw
+      delay: 15m
+      history: '0'
+      value_type: TEXT
+      trends: '0'
+      params: |
+        function CTlsConfig(raw) {
+            raw = String(raw || 'full').trim().toLowerCase();
+            if (['none','peer','full'].indexOf(raw) === -1) raw = 'full';
+            this.options = {
+                SSLVerifyPeer: (raw === 'peer' || raw === 'full'),
+                SSLVerifyHost: (raw === 'full')
+            };
+        }
+        function validate(required, p) {
+            for (var i = 0; i < required.length; i++) {
+                if (typeof p[required[i]] === 'undefined' || p[required[i]] === '')
+                    throw 'Required parameter is not set: ' + required[i];
+            }
+        }
+        function OCI(params) {
+            this.req = new HttpRequest((new CTlsConfig(params.tls_verify)).options);
+            if (params.http_proxy) this.req.setProxy(params.http_proxy);
+            this.hash = function(s) { return sha256(s); };
+            this.sign = function(s) { return sign('sha256', params.private_key, s); };
+            this.encode = function(hash) {
+                var hexArr = hash.match(/.{1,2}/g), a = new Uint8Array(hexArr.length);
+                hexArr.forEach(function(h, i) { a[i] = parseInt(h, 16); });
+                return btoa(a);
+            };
+            this.date = function() {
+                var wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+                var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                var d=new Date();
+                function p(n){return n<10?'0'+n:String(n);}
+                return wd[d.getUTCDay()]+', '+p(d.getUTCDate())+' '+mo[d.getUTCMonth()]+' '+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' GMT';
+            };
+            this.call = function(method, host, path, query, bodyObj) {
+                method = method.toLowerCase(); query = query || '';
+                var body = bodyObj === null || typeof bodyObj === 'undefined' ? '' : JSON.stringify(bodyObj);
+                var attempt=0, response='', status=0, headersObj={};
+                while (attempt < 4) {
+                    attempt++;
+                    this.req.clearHeader();
+                    var signed='(request-target) date host';
+                    var dateHeader='date: '+this.date();
+                    var hostHeader='host: '+host;
+                    var target='(request-target): '+method+' '+path+query;
+                    var signing=target+'\n'+dateHeader+'\n'+hostHeader;
+                    var reqHeaders=['content-type: application/json', dateHeader];
+                    if (method !== 'get' && method !== 'head') {
+                        signed += ' x-content-sha256 content-type content-length';
+                        var hashHeader='x-content-sha256: '+this.encode(this.hash(body));
+                        var lenHeader='content-length: '+body.length;
+                        signing += '\n'+hashHeader+'\ncontent-type: application/json\n'+lenHeader;
+                        reqHeaders.push(hashHeader, lenHeader);
+                    }
+                    var signature=this.encode(this.sign(signing));
+                    reqHeaders.push('Authorization: Signature version="1",keyId="'+params.tenancy_ocid+'/'+params.user_ocid+'/'+params.fingerprint+'",algorithm="rsa-sha256",headers="'+signed+'",signature="'+signature+'"');
+                    for (var h=0;h<reqHeaders.length;h++) this.req.addHeader(reqHeaders[h]);
+                    var url='https://'+host+path+query;
+                    response = method === 'get' ? this.req.get(url) : this.req.post(url, body);
+                    status=this.req.getStatus(); headersObj=this.req.getHeaders(false) || {};
+                    if (status !== 429 && status < 500) break;
+                    Zabbix.sleep(attempt * 500);
+                }
+                this.req.clearHeader();
+                if (status < 200 || status >= 300) {
+                    var msg=response;
+                    try { var e=JSON.parse(response); msg=e.message || e.code || response; } catch(ignore) {}
+                    throw host+path+query+' returned HTTP '+status+': '+msg;
+                }
+                return {body:response, headers:headersObj, status:status};
+            };
+        }
+        function headerValue(headers, wanted) {
+            wanted=String(wanted).toLowerCase();
+            for (var k in headers) if (String(k).toLowerCase() === wanted) {
+                var v=headers[k]; return Array.isArray(v) ? (v.length ? v[0] : '') : v;
+            }
+            return '';
+        }
+        function endpoint(params, kind) {
+            var ov=params[kind+'_host'];
+            if (ov) return ov.replace(/^https?:\/\//i,'').replace(/\/$/,'');
+            var r=params.region, dom=params.realm_domain || 'oraclecloud.com';
+            if (kind === 'search') return 'query.'+r+'.oci.'+dom;
+            if (kind === 'file') return 'filestorage.'+r+'.'+dom;
+            if (kind === 'telemetry') return 'telemetry.'+r+'.'+dom;
+            if (kind === 'core') return 'iaas.'+r+'.'+dom;
+            throw 'Unknown endpoint kind: '+kind;
+        }
+
+        var result={status:0,error:'',filesystems:[],mounttargets:[]};
+        try {
+            var p=JSON.parse(value);
+            validate(['tenancy_ocid','user_ocid','fingerprint','private_key','region'],p);
+            var oci=new OCI(p), host=endpoint(p,'search');
+            function search(q) {
+                var out=[], page='', guard=0;
+                do {
+                    guard++; if (guard>100) throw 'Resource Search pagination exceeded 100 pages';
+                    var qs='?limit=1000'+(page?'&page='+encodeURIComponent(page):'');
+                    var r=oci.call('post',host,'/20180409/resources',qs,{type:'Structured',query:q,matchingContextType:'NONE'});
+                    var j=JSON.parse(r.body), items=j.items || [];
+                    for (var i=0;i<items.length;i++) out.push(items[i]);
+                    page=headerValue(r.headers,'opc-next-page');
+                } while(page);
+                return out;
+            }
+            function cleanName(x){return x.displayName || x.identifier || 'unnamed';}
+            var fs=search('query filesystem resources');
+            for (var i=0;i<fs.length;i++) {
+                if (fs[i].lifecycleState === 'DELETED') continue;
+                result.filesystems.push({
+                    '{#FS.ID}':fs[i].identifier,
+                    '{#FS.NAME}':cleanName(fs[i]),
+                    '{#FS.COMPARTMENT}':fs[i].compartmentId || '',
+                    '{#FS.AD}':fs[i].availabilityDomain || '',
+                    '{#FS.STATE}':fs[i].lifecycleState || 'UNKNOWN'
+                });
+            }
+            var mt=search('query mounttarget resources');
+            for (var m=0;m<mt.length;m++) {
+                if (mt[m].lifecycleState === 'DELETED') continue;
+                result.mounttargets.push({
+                    '{#MT.ID}':mt[m].identifier,
+                    '{#MT.NAME}':cleanName(mt[m]),
+                    '{#MT.COMPARTMENT}':mt[m].compartmentId || '',
+                    '{#MT.AD}':mt[m].availabilityDomain || '',
+                    '{#MT.STATE}':mt[m].lifecycleState || 'UNKNOWN'
+                });
+            }
+            result.status=1;
+        } catch(e) { result.error=String(e); Zabbix.log(3,'[ OCI FSS discovery ] '+result.error); }
+        return JSON.stringify(result);
+      timeout: 60s
+      parameters:
+      - name: tenancy_ocid
+        value: '{$OCI.API.TENANCY}'
+      - name: user_ocid
+        value: '{$OCI.API.USER}'
+      - name: fingerprint
+        value: '{$OCI.API.FINGERPRINT}'
+      - name: private_key
+        value: '{$OCI.API.PRIVATE.KEY}'
+      - name: region
+        value: '{$OCI.FSS.REGION}'
+      - name: realm_domain
+        value: '{$OCI.FSS.REALM.DOMAIN}'
+      - name: search_host
+        value: '{$OCI.FSS.SEARCH.HOST}'
+      - name: file_host
+        value: '{$OCI.FSS.FILE.HOST}'
+      - name: telemetry_host
+        value: '{$OCI.FSS.TELEMETRY.HOST}'
+      - name: core_host
+        value: '{$OCI.FSS.CORE.HOST}'
+      - name: http_proxy
+        value: '{$OCI.HTTP.PROXY}'
+      - name: tls_verify
+        value: '{$OCI.FSS.TLS.VERIFY}'
+      tags:
+      - &id001
+        tag: component
+        value: oci-fss
+      - tag: scope
+        value: raw
+    - uuid: 2a487618e9fa4a67b235e89d7e7daddd
+      name: 'OCI FSS: Discovery API status'
+      type: DEPENDENT
+      key: oci.fss.discovery.status
+      delay: '0'
+      history: 14d
+      trends: 365d
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return d.status||0;
+      master_item:
+        key: oci.fss.discovery.raw
+      valuemap:
+        name: OCI API status
+      tags: &id002
+      - *id001
+      - tag: scope
+        value: availability
+      triggers:
+      - uuid: f67e45ee4c13494c8022b9eca58fcc0a
+        expression: last(/Oracle OCI File Storage by HTTP/oci.fss.discovery.status)=0
+        name: 'OCI FSS: Resource discovery API failed'
+        priority: HIGH
+        description: Resource Search could not discover File Storage resources.
+        tags: *id002
+    - uuid: b4fc2493e89544f9af710fcd33f607d7
+      name: 'OCI FSS: Discovery error'
+      type: DEPENDENT
+      key: oci.fss.discovery.error
+      delay: '0'
+      history: 1d
+      trends: '0'
+      value_type: TEXT
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return d.error||'';
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1h
+      master_item:
+        key: oci.fss.discovery.raw
+      tags: &id003
+      - *id001
+    - uuid: 514b3f93d36d47dcb8d91fc54f95c0be
+      name: 'OCI FSS: File systems discovered'
+      type: DEPENDENT
+      key: oci.fss.filesystems.count
+      delay: '0'
+      history: 14d
+      trends: 365d
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return (d.filesystems||[]).length;
+      master_item:
+        key: oci.fss.discovery.raw
+      tags: *id003
+    - uuid: ea057eef1802457a8dc5e14e10383e1c
+      name: 'OCI FSS: Mount targets discovered'
+      type: DEPENDENT
+      key: oci.fss.mounttargets.count
+      delay: '0'
+      history: 14d
+      trends: 365d
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return (d.mounttargets||[]).length;
+      master_item:
+        key: oci.fss.discovery.raw
+      tags: *id003
+    - uuid: 10c70929fc1f4eeb9dd96bfefefc8340
+      name: 'OCI FSS: Fast metrics raw'
+      type: SCRIPT
+      key: oci.fss.metrics.fast.raw
+      delay: 1m
+      history: '0'
+      value_type: TEXT
+      trends: '0'
+      params: |
+        function CTlsConfig(raw) {
+            raw = String(raw || 'full').trim().toLowerCase();
+            if (['none','peer','full'].indexOf(raw) === -1) raw = 'full';
+            this.options = {
+                SSLVerifyPeer: (raw === 'peer' || raw === 'full'),
+                SSLVerifyHost: (raw === 'full')
+            };
+        }
+        function validate(required, p) {
+            for (var i = 0; i < required.length; i++) {
+                if (typeof p[required[i]] === 'undefined' || p[required[i]] === '')
+                    throw 'Required parameter is not set: ' + required[i];
+            }
+        }
+        function OCI(params) {
+            this.req = new HttpRequest((new CTlsConfig(params.tls_verify)).options);
+            if (params.http_proxy) this.req.setProxy(params.http_proxy);
+            this.hash = function(s) { return sha256(s); };
+            this.sign = function(s) { return sign('sha256', params.private_key, s); };
+            this.encode = function(hash) {
+                var hexArr = hash.match(/.{1,2}/g), a = new Uint8Array(hexArr.length);
+                hexArr.forEach(function(h, i) { a[i] = parseInt(h, 16); });
+                return btoa(a);
+            };
+            this.date = function() {
+                var wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+                var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                var d=new Date();
+                function p(n){return n<10?'0'+n:String(n);}
+                return wd[d.getUTCDay()]+', '+p(d.getUTCDate())+' '+mo[d.getUTCMonth()]+' '+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' GMT';
+            };
+            this.call = function(method, host, path, query, bodyObj) {
+                method = method.toLowerCase(); query = query || '';
+                var body = bodyObj === null || typeof bodyObj === 'undefined' ? '' : JSON.stringify(bodyObj);
+                var attempt=0, response='', status=0, headersObj={};
+                while (attempt < 4) {
+                    attempt++;
+                    this.req.clearHeader();
+                    var signed='(request-target) date host';
+                    var dateHeader='date: '+this.date();
+                    var hostHeader='host: '+host;
+                    var target='(request-target): '+method+' '+path+query;
+                    var signing=target+'\n'+dateHeader+'\n'+hostHeader;
+                    var reqHeaders=['content-type: application/json', dateHeader];
+                    if (method !== 'get' && method !== 'head') {
+                        signed += ' x-content-sha256 content-type content-length';
+                        var hashHeader='x-content-sha256: '+this.encode(this.hash(body));
+                        var lenHeader='content-length: '+body.length;
+                        signing += '\n'+hashHeader+'\ncontent-type: application/json\n'+lenHeader;
+                        reqHeaders.push(hashHeader, lenHeader);
+                    }
+                    var signature=this.encode(this.sign(signing));
+                    reqHeaders.push('Authorization: Signature version="1",keyId="'+params.tenancy_ocid+'/'+params.user_ocid+'/'+params.fingerprint+'",algorithm="rsa-sha256",headers="'+signed+'",signature="'+signature+'"');
+                    for (var h=0;h<reqHeaders.length;h++) this.req.addHeader(reqHeaders[h]);
+                    var url='https://'+host+path+query;
+                    response = method === 'get' ? this.req.get(url) : this.req.post(url, body);
+                    status=this.req.getStatus(); headersObj=this.req.getHeaders(false) || {};
+                    if (status !== 429 && status < 500) break;
+                    Zabbix.sleep(attempt * 500);
+                }
+                this.req.clearHeader();
+                if (status < 200 || status >= 300) {
+                    var msg=response;
+                    try { var e=JSON.parse(response); msg=e.message || e.code || response; } catch(ignore) {}
+                    throw host+path+query+' returned HTTP '+status+': '+msg;
+                }
+                return {body:response, headers:headersObj, status:status};
+            };
+        }
+        function headerValue(headers, wanted) {
+            wanted=String(wanted).toLowerCase();
+            for (var k in headers) if (String(k).toLowerCase() === wanted) {
+                var v=headers[k]; return Array.isArray(v) ? (v.length ? v[0] : '') : v;
+            }
+            return '';
+        }
+        function endpoint(params, kind) {
+            var ov=params[kind+'_host'];
+            if (ov) return ov.replace(/^https?:\/\//i,'').replace(/\/$/,'');
+            var r=params.region, dom=params.realm_domain || 'oraclecloud.com';
+            if (kind === 'search') return 'query.'+r+'.oci.'+dom;
+            if (kind === 'file') return 'filestorage.'+r+'.'+dom;
+            if (kind === 'telemetry') return 'telemetry.'+r+'.'+dom;
+            if (kind === 'core') return 'iaas.'+r+'.'+dom;
+            throw 'Unknown endpoint kind: '+kind;
+        }
+
+        var out={status:0,error:'',errors:[],fs:{},mt:{}};
+        try {
+            var p=JSON.parse(value); validate(['tenancy_ocid','user_ocid','fingerprint','private_key','region'],p);
+            var oci=new OCI(p), host=endpoint(p,'telemetry');
+            var qp='?compartmentId='+encodeURIComponent(p.tenancy_ocid)+'&compartmentIdInSubtree=true';
+            function latest(s){var a=s.aggregatedDatapoints||[]; return a.length?Number(a[a.length-1].value):null;}
+            function bucket(root,id){if(!root[id])root[id]={};return root[id];}
+            function getMetric(name,query,handler){
+                try {
+                    var r=oci.call('post',host,'/20180401/metrics/actions/summarizeMetricsData',qp,{namespace:'oci_filestorage',query:query});
+                    var a=JSON.parse(r.body)||[];
+                    for(var i=0;i<a.length;i++){var v=latest(a[i]); if(v===null)continue; handler(a[i].dimensions||{},v);}
+                } catch(e){out.errors.push(name+': '+String(e));}
+                Zabbix.sleep(130);
+            }
+            getMetric('FileSystemReadThroughput','FileSystemReadThroughput[1m].groupBy(resourceId).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId).readThroughput=v;});
+            getMetric('FileSystemWriteThroughput','FileSystemWriteThroughput[1m].groupBy(resourceId).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId).writeThroughput=v;});
+            getMetric('FileSystemReadRequestsbySize','FileSystemReadRequestsbySize[1m].groupBy(resourceId,size).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId)['readOps_'+d.size]=v;});
+            getMetric('FileSystemWriteRequestsbySize','FileSystemWriteRequestsbySize[1m].groupBy(resourceId,size).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId)['writeOps_'+d.size]=v;});
+            getMetric('FileSystemReadAverageLatencybySize','FileSystemReadAverageLatencybySize[1m].groupBy(resourceId,size).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId)['readLatency_'+d.size]=v;});
+            getMetric('FileSystemWriteAverageLatencybySize','FileSystemWriteAverageLatencybySize[1m].groupBy(resourceId,size).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId)['writeLatency_'+d.size]=v;});
+            getMetric('MetadataRequestAverageLatency','MetadataRequestAverageLatency[1m].groupBy(resourceId,operation).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId)['metaLatency_'+d.operation]=v;});
+            getMetric('MetadataIOPS','MetadataIOPS[1m].groupBy(resourceId,operation).mean()',function(d,v){if(d.resourceId)bucket(out.fs,d.resourceId)['metaIops_'+d.operation]=v;});
+            getMetric('MountTargetReadThroughput','MountTargetReadThroughput[1m].groupBy(resourceId).mean()',function(d,v){if(d.resourceId)bucket(out.mt,d.resourceId).readThroughput=v;});
+            getMetric('MountTargetWriteThroughput','MountTargetWriteThroughput[1m].groupBy(resourceId).mean()',function(d,v){if(d.resourceId)bucket(out.mt,d.resourceId).writeThroughput=v;});
+            getMetric('MountTargetConnections','MountTargetConnections[1m].groupBy(resourceId).sum()',function(d,v){if(d.resourceId)bucket(out.mt,d.resourceId).connections=v;});
+            getMetric('MountTargetHealth','MountTargetHealth[1m].groupBy(resourceId,healthItem).mean()',function(d,v){if(d.resourceId)bucket(out.mt,d.resourceId)['health_'+d.healthItem]=v;});
+            out.status=out.errors.length?0:1;
+            if(out.errors.length)out.error=out.errors.join(' | ');
+        } catch(e){out.error=String(e); Zabbix.log(3,'[ OCI FSS fast metrics ] '+out.error);}
+        return JSON.stringify(out);
+      timeout: 60s
+      parameters:
+      - name: tenancy_ocid
+        value: '{$OCI.API.TENANCY}'
+      - name: user_ocid
+        value: '{$OCI.API.USER}'
+      - name: fingerprint
+        value: '{$OCI.API.FINGERPRINT}'
+      - name: private_key
+        value: '{$OCI.API.PRIVATE.KEY}'
+      - name: region
+        value: '{$OCI.FSS.REGION}'
+      - name: realm_domain
+        value: '{$OCI.FSS.REALM.DOMAIN}'
+      - name: search_host
+        value: '{$OCI.FSS.SEARCH.HOST}'
+      - name: file_host
+        value: '{$OCI.FSS.FILE.HOST}'
+      - name: telemetry_host
+        value: '{$OCI.FSS.TELEMETRY.HOST}'
+      - name: core_host
+        value: '{$OCI.FSS.CORE.HOST}'
+      - name: http_proxy
+        value: '{$OCI.HTTP.PROXY}'
+      - name: tls_verify
+        value: '{$OCI.FSS.TLS.VERIFY}'
+      tags:
+      - *id001
+      - tag: scope
+        value: raw
+    - uuid: c1e6ae7170d54995a49b3db0b35ecc39
+      name: 'OCI FSS: Fast metrics API status'
+      type: DEPENDENT
+      key: oci.fss.metrics.fast.status
+      delay: '0'
+      history: 14d
+      trends: 365d
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return d.status||0;
+      master_item:
+        key: oci.fss.metrics.fast.raw
+      valuemap:
+        name: OCI API status
+      tags: *id002
+      triggers:
+      - uuid: 5d0f3dad1e804b399818f6feba20776d
+        expression: max(/Oracle OCI File Storage by HTTP/oci.fss.metrics.fast.status,5m)=0
+        name: 'OCI FSS: Monitoring API fast collector failed'
+        priority: HIGH
+        description: OCI Monitoring queries for File Storage have failed for at least five minutes.
+        tags: *id002
+    - uuid: 138aeccb215b4eeb92e151c96f1c83a9
+      name: 'OCI FSS: Fast metrics error'
+      type: DEPENDENT
+      key: oci.fss.metrics.fast.error
+      delay: '0'
+      history: 1d
+      trends: '0'
+      value_type: TEXT
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return d.error||'';
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1h
+      master_item:
+        key: oci.fss.metrics.fast.raw
+      tags: *id003
+    - uuid: 57a87afa1ed34bc3a61a4f1e029bea0a
+      name: 'OCI FSS: Slow metrics raw'
+      type: SCRIPT
+      key: oci.fss.metrics.slow.raw
+      delay: 5m
+      history: '0'
+      value_type: TEXT
+      trends: '0'
+      params: |
+        function CTlsConfig(raw) {
+            raw = String(raw || 'full').trim().toLowerCase();
+            if (['none','peer','full'].indexOf(raw) === -1) raw = 'full';
+            this.options = {
+                SSLVerifyPeer: (raw === 'peer' || raw === 'full'),
+                SSLVerifyHost: (raw === 'full')
+            };
+        }
+        function validate(required, p) {
+            for (var i = 0; i < required.length; i++) {
+                if (typeof p[required[i]] === 'undefined' || p[required[i]] === '')
+                    throw 'Required parameter is not set: ' + required[i];
+            }
+        }
+        function OCI(params) {
+            this.req = new HttpRequest((new CTlsConfig(params.tls_verify)).options);
+            if (params.http_proxy) this.req.setProxy(params.http_proxy);
+            this.hash = function(s) { return sha256(s); };
+            this.sign = function(s) { return sign('sha256', params.private_key, s); };
+            this.encode = function(hash) {
+                var hexArr = hash.match(/.{1,2}/g), a = new Uint8Array(hexArr.length);
+                hexArr.forEach(function(h, i) { a[i] = parseInt(h, 16); });
+                return btoa(a);
+            };
+            this.date = function() {
+                var wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+                var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                var d=new Date();
+                function p(n){return n<10?'0'+n:String(n);}
+                return wd[d.getUTCDay()]+', '+p(d.getUTCDate())+' '+mo[d.getUTCMonth()]+' '+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' GMT';
+            };
+            this.call = function(method, host, path, query, bodyObj) {
+                method = method.toLowerCase(); query = query || '';
+                var body = bodyObj === null || typeof bodyObj === 'undefined' ? '' : JSON.stringify(bodyObj);
+                var attempt=0, response='', status=0, headersObj={};
+                while (attempt < 4) {
+                    attempt++;
+                    this.req.clearHeader();
+                    var signed='(request-target) date host';
+                    var dateHeader='date: '+this.date();
+                    var hostHeader='host: '+host;
+                    var target='(request-target): '+method+' '+path+query;
+                    var signing=target+'\n'+dateHeader+'\n'+hostHeader;
+                    var reqHeaders=['content-type: application/json', dateHeader];
+                    if (method !== 'get' && method !== 'head') {
+                        signed += ' x-content-sha256 content-type content-length';
+                        var hashHeader='x-content-sha256: '+this.encode(this.hash(body));
+                        var lenHeader='content-length: '+body.length;
+                        signing += '\n'+hashHeader+'\ncontent-type: application/json\n'+lenHeader;
+                        reqHeaders.push(hashHeader, lenHeader);
+                    }
+                    var signature=this.encode(this.sign(signing));
+                    reqHeaders.push('Authorization: Signature version="1",keyId="'+params.tenancy_ocid+'/'+params.user_ocid+'/'+params.fingerprint+'",algorithm="rsa-sha256",headers="'+signed+'",signature="'+signature+'"');
+                    for (var h=0;h<reqHeaders.length;h++) this.req.addHeader(reqHeaders[h]);
+                    var url='https://'+host+path+query;
+                    response = method === 'get' ? this.req.get(url) : this.req.post(url, body);
+                    status=this.req.getStatus(); headersObj=this.req.getHeaders(false) || {};
+                    if (status !== 429 && status < 500) break;
+                    Zabbix.sleep(attempt * 500);
+                }
+                this.req.clearHeader();
+                if (status < 200 || status >= 300) {
+                    var msg=response;
+                    try { var e=JSON.parse(response); msg=e.message || e.code || response; } catch(ignore) {}
+                    throw host+path+query+' returned HTTP '+status+': '+msg;
+                }
+                return {body:response, headers:headersObj, status:status};
+            };
+        }
+        function headerValue(headers, wanted) {
+            wanted=String(wanted).toLowerCase();
+            for (var k in headers) if (String(k).toLowerCase() === wanted) {
+                var v=headers[k]; return Array.isArray(v) ? (v.length ? v[0] : '') : v;
+            }
+            return '';
+        }
+        function endpoint(params, kind) {
+            var ov=params[kind+'_host'];
+            if (ov) return ov.replace(/^https?:\/\//i,'').replace(/\/$/,'');
+            var r=params.region, dom=params.realm_domain || 'oraclecloud.com';
+            if (kind === 'search') return 'query.'+r+'.oci.'+dom;
+            if (kind === 'file') return 'filestorage.'+r+'.'+dom;
+            if (kind === 'telemetry') return 'telemetry.'+r+'.'+dom;
+            if (kind === 'core') return 'iaas.'+r+'.'+dom;
+            throw 'Unknown endpoint kind: '+kind;
+        }
+
+        var out={status:0,error:'',errors:[],fs:{}};
+        try {
+            var p=JSON.parse(value); validate(['tenancy_ocid','user_ocid','fingerprint','private_key','region'],p);
+            var oci=new OCI(p), host=endpoint(p,'telemetry');
+            var qp='?compartmentId='+encodeURIComponent(p.tenancy_ocid)+'&compartmentIdInSubtree=true';
+            function latest(s){var a=s.aggregatedDatapoints||[]; return a.length?Number(a[a.length-1].value):null;}
+            function bucket(id){if(!out.fs[id])out.fs[id]={};return out.fs[id];}
+            function q(name,mql,field){try{var r=oci.call('post',host,'/20180401/metrics/actions/summarizeMetricsData',qp,{namespace:'oci_filestorage',query:mql});var a=JSON.parse(r.body)||[];for(var i=0;i<a.length;i++){var d=a[i].dimensions||{},v=latest(a[i]);if(d.resourceId&&v!==null)bucket(d.resourceId)[field]=v;}}catch(e){out.errors.push(name+': '+String(e));}Zabbix.sleep(130);}
+            q('FileSystemUsage','FileSystemUsage[1h].groupBy(resourceId).mean()','usage');
+            q('UserSoftQuotaViolations','UserSoftQuotaViolations[1h].groupBy(resourceId).sum()','softViolations');
+            q('UserHardQuotaViolations','UserHardQuotaViolations[1h].groupBy(resourceId).sum()','hardViolations');
+            out.status=out.errors.length?0:1; if(out.errors.length)out.error=out.errors.join(' | ');
+        } catch(e){out.error=String(e);Zabbix.log(3,'[ OCI FSS slow metrics ] '+out.error);}
+        return JSON.stringify(out);
+      timeout: 30s
+      parameters:
+      - name: tenancy_ocid
+        value: '{$OCI.API.TENANCY}'
+      - name: user_ocid
+        value: '{$OCI.API.USER}'
+      - name: fingerprint
+        value: '{$OCI.API.FINGERPRINT}'
+      - name: private_key
+        value: '{$OCI.API.PRIVATE.KEY}'
+      - name: region
+        value: '{$OCI.FSS.REGION}'
+      - name: realm_domain
+        value: '{$OCI.FSS.REALM.DOMAIN}'
+      - name: search_host
+        value: '{$OCI.FSS.SEARCH.HOST}'
+      - name: file_host
+        value: '{$OCI.FSS.FILE.HOST}'
+      - name: telemetry_host
+        value: '{$OCI.FSS.TELEMETRY.HOST}'
+      - name: core_host
+        value: '{$OCI.FSS.CORE.HOST}'
+      - name: http_proxy
+        value: '{$OCI.HTTP.PROXY}'
+      - name: tls_verify
+        value: '{$OCI.FSS.TLS.VERIFY}'
+      tags:
+      - *id001
+      - tag: scope
+        value: raw
+    - uuid: 6c812c631ba14df483236b29bf431252
+      name: 'OCI FSS: Slow metrics API status'
+      type: DEPENDENT
+      key: oci.fss.metrics.slow.status
+      delay: '0'
+      history: 14d
+      trends: 365d
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return d.status||0;
+      master_item:
+        key: oci.fss.metrics.slow.raw
+      valuemap:
+        name: OCI API status
+      tags: *id002
+      triggers:
+      - uuid: 2ac8a54c097846c2ac9fb1cdbfaef8b0
+        expression: max(/Oracle OCI File Storage by HTTP/oci.fss.metrics.slow.status,15m)=0
+        name: 'OCI FSS: Monitoring API slow collector failed'
+        priority: WARNING
+        description: OCI File Storage usage/quota violation metrics have failed for at least fifteen minutes.
+        tags: *id002
+    - uuid: ce2ed3c12d3a4eb3834b22d7c6083e3d
+      name: 'OCI FSS: Slow metrics error'
+      type: DEPENDENT
+      key: oci.fss.metrics.slow.error
+      delay: '0'
+      history: 1d
+      trends: '0'
+      value_type: TEXT
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return d.error||'';
+      - type: DISCARD_UNCHANGED_HEARTBEAT
+        parameters:
+        - 1h
+      master_item:
+        key: oci.fss.metrics.slow.raw
+      tags: *id003
+    discovery_rules:
+    - uuid: abff5809f2b94d33852222efce03c6f2
+      name: OCI FSS file systems discovery
+      type: DEPENDENT
+      key: oci.fss.filesystems.discovery
+      delay: '0'
+      filter:
+        evaltype: AND
+        conditions:
+        - macro: '{#FS.NAME}'
+          value: '{$OCI.FSS.FS.NAME.MATCHES}'
+          formulaid: A
+        - macro: '{#FS.NAME}'
+          value: '{$OCI.FSS.FS.NAME.NOT_MATCHES}'
+          operator: NOT_MATCHES_REGEX
+          formulaid: B
+      lifetime: 30d
+      lifetime_type: DELETE_AFTER
+      enabled_lifetime: 1d
+      enabled_lifetime_type: DISABLE_AFTER
+      item_prototypes:
+      - uuid: 9c977e6e5ecb422daea66838a7a92806
+        name: 'OCI FSS [{#FS.NAME}]: Details raw'
+        type: SCRIPT
+        key: oci.fss.fs.details["{#FS.ID}"]
+        delay: 15m
+        history: '0'
+        value_type: TEXT
+        trends: '0'
+        params: |
+          function CTlsConfig(raw) {
+              raw = String(raw || 'full').trim().toLowerCase();
+              if (['none','peer','full'].indexOf(raw) === -1) raw = 'full';
+              this.options = {
+                  SSLVerifyPeer: (raw === 'peer' || raw === 'full'),
+                  SSLVerifyHost: (raw === 'full')
+              };
+          }
+          function validate(required, p) {
+              for (var i = 0; i < required.length; i++) {
+                  if (typeof p[required[i]] === 'undefined' || p[required[i]] === '')
+                      throw 'Required parameter is not set: ' + required[i];
+              }
+          }
+          function OCI(params) {
+              this.req = new HttpRequest((new CTlsConfig(params.tls_verify)).options);
+              if (params.http_proxy) this.req.setProxy(params.http_proxy);
+              this.hash = function(s) { return sha256(s); };
+              this.sign = function(s) { return sign('sha256', params.private_key, s); };
+              this.encode = function(hash) {
+                  var hexArr = hash.match(/.{1,2}/g), a = new Uint8Array(hexArr.length);
+                  hexArr.forEach(function(h, i) { a[i] = parseInt(h, 16); });
+                  return btoa(a);
+              };
+              this.date = function() {
+                  var wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+                  var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                  var d=new Date();
+                  function p(n){return n<10?'0'+n:String(n);}
+                  return wd[d.getUTCDay()]+', '+p(d.getUTCDate())+' '+mo[d.getUTCMonth()]+' '+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' GMT';
+              };
+              this.call = function(method, host, path, query, bodyObj) {
+                  method = method.toLowerCase(); query = query || '';
+                  var body = bodyObj === null || typeof bodyObj === 'undefined' ? '' : JSON.stringify(bodyObj);
+                  var attempt=0, response='', status=0, headersObj={};
+                  while (attempt < 4) {
+                      attempt++;
+                      this.req.clearHeader();
+                      var signed='(request-target) date host';
+                      var dateHeader='date: '+this.date();
+                      var hostHeader='host: '+host;
+                      var target='(request-target): '+method+' '+path+query;
+                      var signing=target+'\n'+dateHeader+'\n'+hostHeader;
+                      var reqHeaders=['content-type: application/json', dateHeader];
+                      if (method !== 'get' && method !== 'head') {
+                          signed += ' x-content-sha256 content-type content-length';
+                          var hashHeader='x-content-sha256: '+this.encode(this.hash(body));
+                          var lenHeader='content-length: '+body.length;
+                          signing += '\n'+hashHeader+'\ncontent-type: application/json\n'+lenHeader;
+                          reqHeaders.push(hashHeader, lenHeader);
+                      }
+                      var signature=this.encode(this.sign(signing));
+                      reqHeaders.push('Authorization: Signature version="1",keyId="'+params.tenancy_ocid+'/'+params.user_ocid+'/'+params.fingerprint+'",algorithm="rsa-sha256",headers="'+signed+'",signature="'+signature+'"');
+                      for (var h=0;h<reqHeaders.length;h++) this.req.addHeader(reqHeaders[h]);
+                      var url='https://'+host+path+query;
+                      response = method === 'get' ? this.req.get(url) : this.req.post(url, body);
+                      status=this.req.getStatus(); headersObj=this.req.getHeaders(false) || {};
+                      if (status !== 429 && status < 500) break;
+                      Zabbix.sleep(attempt * 500);
+                  }
+                  this.req.clearHeader();
+                  if (status < 200 || status >= 300) {
+                      var msg=response;
+                      try { var e=JSON.parse(response); msg=e.message || e.code || response; } catch(ignore) {}
+                      throw host+path+query+' returned HTTP '+status+': '+msg;
+                  }
+                  return {body:response, headers:headersObj, status:status};
+              };
+          }
+          function headerValue(headers, wanted) {
+              wanted=String(wanted).toLowerCase();
+              for (var k in headers) if (String(k).toLowerCase() === wanted) {
+                  var v=headers[k]; return Array.isArray(v) ? (v.length ? v[0] : '') : v;
+              }
+              return '';
+          }
+          function endpoint(params, kind) {
+              var ov=params[kind+'_host'];
+              if (ov) return ov.replace(/^https?:\/\//i,'').replace(/\/$/,'');
+              var r=params.region, dom=params.realm_domain || 'oraclecloud.com';
+              if (kind === 'search') return 'query.'+r+'.oci.'+dom;
+              if (kind === 'file') return 'filestorage.'+r+'.'+dom;
+              if (kind === 'telemetry') return 'telemetry.'+r+'.'+dom;
+              if (kind === 'core') return 'iaas.'+r+'.'+dom;
+              throw 'Unknown endpoint kind: '+kind;
+          }
+
+          var out={status:0,error:'',quotaError:'',exportsError:'',fs:{},quotaRules:[],exports:[]};
+          try {
+              var p=JSON.parse(value); validate(['tenancy_ocid','user_ocid','fingerprint','private_key','region','fs_id'],p);
+              var oci=new OCI(p), host=endpoint(p,'file'), id=p.fs_id;
+              out.fs=JSON.parse(oci.call('get',host,'/20171215/fileSystems/'+id,'',null).body);
+              try { out.quotaRules=JSON.parse(oci.call('get',host,'/20171215/fileSystems/'+id+'/quotaRules','?principalType=FILE_SYSTEM_LEVEL&limit=100',null).body) || []; }
+              catch(qe){ out.quotaError=String(qe); }
+              try { out.exports=JSON.parse(oci.call('get',host,'/20171215/exports','?fileSystemId='+encodeURIComponent(id)+'&limit=1000',null).body) || []; }
+              catch(ee){ out.exportsError=String(ee); }
+              out.status=1;
+          } catch(e){ out.error=String(e); Zabbix.log(3,'[ OCI FSS filesystem details ] '+out.error); }
+          return JSON.stringify(out);
+        timeout: 30s
+        parameters:
+        - name: tenancy_ocid
+          value: '{$OCI.API.TENANCY}'
+        - name: user_ocid
+          value: '{$OCI.API.USER}'
+        - name: fingerprint
+          value: '{$OCI.API.FINGERPRINT}'
+        - name: private_key
+          value: '{$OCI.API.PRIVATE.KEY}'
+        - name: region
+          value: '{$OCI.FSS.REGION}'
+        - name: realm_domain
+          value: '{$OCI.FSS.REALM.DOMAIN}'
+        - name: search_host
+          value: '{$OCI.FSS.SEARCH.HOST}'
+        - name: file_host
+          value: '{$OCI.FSS.FILE.HOST}'
+        - name: telemetry_host
+          value: '{$OCI.FSS.TELEMETRY.HOST}'
+        - name: core_host
+          value: '{$OCI.FSS.CORE.HOST}'
+        - name: http_proxy
+          value: '{$OCI.HTTP.PROXY}'
+        - name: tls_verify
+          value: '{$OCI.FSS.TLS.VERIFY}'
+        - name: fs_id
+          value: '{#FS.ID}'
+        tags:
+        - *id001
+        - &id004
+          tag: oci.resource
+          value: filesystem
+        - &id005
+          tag: oci.fs
+          value: '{#FS.NAME}'
+        - &id006
+          tag: oci.compartment
+          value: '{#FS.COMPARTMENT}'
+        - tag: scope
+          value: raw
+      - uuid: 91a09b6ca0a9418e8e8e60484c613f61
+        name: 'OCI FSS [{#FS.NAME}]: API status'
+        type: DEPENDENT
+        key: oci.fss.fs.api.status["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return d.status||0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: OCI API status
+        tags: &id007
+        - *id001
+        - *id004
+        - *id005
+        - *id006
+        triggers:
+        - uuid: 6c53355c4cb74c9aa48d29bc0151a1dc
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.fs.api.status["{#FS.ID}"]) = 0
+          name: 'OCI FSS [{#FS.NAME}]: File system API unavailable'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: availability
+      - uuid: 3544add750a541ac9a92fe09e7c6927d
+        name: 'OCI FSS [{#FS.NAME}]: API error'
+        type: DEPENDENT
+        key: oci.fss.fs.api.error["{#FS.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return d.error||'';
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 28eaa68e23044262b0937a0802458e1e
+        name: 'OCI FSS [{#FS.NAME}]: Lifecycle state'
+        type: DEPENDENT
+        key: oci.fss.fs.state["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),s=(d.fs&&d.fs.lifecycleState)||'UNKNOWN';var m={CREATING:0,ACTIVE:1,UPDATING:2,DELETING:3,DELETED:4,FAILED:5};return m[s]===undefined?99:m[s];
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: OCI FSS lifecycle state
+        tags: *id007
+        triggers:
+        - uuid: 11e4239d09a6418e8718a7664614f250
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.fs.state["{#FS.ID}"]) = 5
+          name: 'OCI FSS [{#FS.NAME}]: File system lifecycle FAILED'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: availability
+      - uuid: bcead325301143efb48874712dfbf8bd
+        name: 'OCI FSS [{#FS.NAME}]: Lifecycle details'
+        type: DEPENDENT
+        key: oci.fss.fs.state.details["{#FS.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.lifecycleDetails)||'';
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 48cca24c4a244b218067ed8d8566027c
+        name: 'OCI FSS [{#FS.NAME}]: Metered bytes'
+        type: DEPENDENT
+        key: oci.fss.fs.metered.bytes["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        units: B
+        description: Authoritative metered usage reported by File Storage; OCI updates this asynchronously, typically hourly.
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.meteredBytes)||0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: f51371b71bca498680883047066a06d4
+        name: 'OCI FSS [{#FS.NAME}]: Quota rules enabled'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.enabled["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.areQuotaRulesEnabled)?1:0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: Boolean
+        tags: *id007
+      - uuid: 23e4073558854c0497a00f136e6ebc7a
+        name: 'OCI FSS [{#FS.NAME}]: Quota enforcement state'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.state["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),s=(d.fs&&d.fs.quotaEnforcementState)||'UNKNOWN';var m={DISABLED:0,ENABLING:1,ENABLED:2,DISABLING:3,SYNCING:4,FAILED:5};return m[s]===undefined?99:m[s];
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: OCI FSS quota enforcement state
+        tags: *id007
+        triggers:
+        - uuid: dc45b767694b4925895a761b9d17f2fd
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.state["{#FS.ID}"]) = 5
+          name: 'OCI FSS [{#FS.NAME}]: Quota enforcement FAILED'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: availability
+      - uuid: 8887fa0ff3364919a3a18a9808e076a8
+        name: 'OCI FSS [{#FS.NAME}]: Compartment quota blocked'
+        type: DEPENDENT
+        key: oci.fss.fs.compartment.blocked["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.compartmentQuotaEnforcementState==='BLOCKED')?1:0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: Boolean
+        tags: *id007
+        triggers:
+        - uuid: fdd31ac8258447c99eb8e649f0df076d
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.fs.compartment.blocked["{#FS.ID}"]) = 1
+          name: 'OCI FSS [{#FS.NAME}]: Compartment quota enforcement is BLOCKED'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: capacity
+      - uuid: e6d3a14e9bb2405c9d5aa0d4d32b48b6
+        name: 'OCI FSS [{#FS.NAME}]: File-system quota usage'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.usage["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        units: B
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.quotaRules||[],m=0;for(var i=0;i<a.length;i++)if(a[i].principalType==='FILE_SYSTEM_LEVEL')m=Math.max(m,Number(a[i].usageInBytes||0));return m;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 4f8e0713375a42618e50761edb2af60d
+        name: 'OCI FSS [{#FS.NAME}]: Hard quota limit'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.hard.limit["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        units: B
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.quotaRules||[];for(var i=0;i<a.length;i++)if(a[i].principalType==='FILE_SYSTEM_LEVEL'&&a[i].isHardQuota===true)return Number(a[i].quotaLimitInGigabytes||0)*1073741824;return 0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 84cd9cd6f7484841bcbb8893342703fa
+        name: 'OCI FSS [{#FS.NAME}]: Soft quota limit'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.soft.limit["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        units: B
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.quotaRules||[];for(var i=0;i<a.length;i++)if(a[i].principalType==='FILE_SYSTEM_LEVEL'&&a[i].isHardQuota===false)return Number(a[i].quotaLimitInGigabytes||0)*1073741824;return 0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 73b4a235294a4ce18f40a437e3249721
+        name: 'OCI FSS [{#FS.NAME}]: Hard quota used, %'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.hard.pused["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: '%'
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.quotaRules||[],u=0,l=0;for(var i=0;i<a.length;i++){if(a[i].principalType!=='FILE_SYSTEM_LEVEL')continue;u=Math.max(u,Number(a[i].usageInBytes||0));if(a[i].isHardQuota===true)l=Number(a[i].quotaLimitInGigabytes||0)*1073741824;}return l>0?(u/l*100):0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+        triggers:
+        - uuid: 001881171b1a404ea4bfe6e56e6971e9
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.hard.pused["{#FS.ID}"],15m)>={$OCI.FSS.QUOTA.WARN}
+            and avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.hard.pused["{#FS.ID}"],15m)<{$OCI.FSS.QUOTA.CRIT}
+          name: 'OCI FSS [{#FS.NAME}]: Hard quota usage is high'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: capacity
+        - uuid: 30f8ef04407b4f51822f6e0d65ded693
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.hard.pused["{#FS.ID}"],15m)>={$OCI.FSS.QUOTA.CRIT}
+          name: 'OCI FSS [{#FS.NAME}]: Hard quota usage is critical'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: capacity
+      - uuid: 36dd905e432f431abd3384e7b4d56580
+        name: 'OCI FSS [{#FS.NAME}]: Soft quota used, %'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.soft.pused["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: '%'
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.quotaRules||[],u=0,l=0;for(var i=0;i<a.length;i++){if(a[i].principalType!=='FILE_SYSTEM_LEVEL')continue;u=Math.max(u,Number(a[i].usageInBytes||0));if(a[i].isHardQuota===false)l=Number(a[i].quotaLimitInGigabytes||0)*1073741824;}return l>0?(u/l*100):0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+        triggers:
+        - uuid: dfc32fe1561e4a51a0822d22ced6a733
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.soft.pused["{#FS.ID}"],15m)>100
+          name: 'OCI FSS [{#FS.NAME}]: Soft file-system quota exceeded'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: capacity
+      - uuid: 332335470ce5415ab09084e6b3f40fb1
+        name: 'OCI FSS [{#FS.NAME}]: Hard quota remaining'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.hard.remaining["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        units: B
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.quotaRules||[],u=0,l=0;for(var i=0;i<a.length;i++){if(a[i].principalType!=='FILE_SYSTEM_LEVEL')continue;u=Math.max(u,Number(a[i].usageInBytes||0));if(a[i].isHardQuota===true)l=Number(a[i].quotaLimitInGigabytes||0)*1073741824;}return l>0?Math.max(0,l-u):0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 327b5b91784547c18c87fae760a57bd4
+        name: 'OCI FSS [{#FS.NAME}]: Export count'
+        type: DEPENDENT
+        key: oci.fss.fs.exports.count["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.exports||[]).length;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: ea9d770128fb482287a31a38c1479d74
+        name: 'OCI FSS [{#FS.NAME}]: Export paths'
+        type: DEPENDENT
+        key: oci.fss.fs.exports.paths["{#FS.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.exports||[],o=[];for(var i=0;i<a.length;i++)o.push(a[i].path||'');return o.join(', ');
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: e7b214c0ce5f48c5906121eaa3f72997
+        name: 'OCI FSS [{#FS.NAME}]: Replication source count'
+        type: DEPENDENT
+        key: oci.fss.fs.replication.source.count["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.replicationSourceCount)||0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: 2d017223f69b414e8cf658b7d0dbaaa9
+        name: 'OCI FSS [{#FS.NAME}]: Is replication target'
+        type: DEPENDENT
+        key: oci.fss.fs.replication.target["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.replicationTargetId)?1:0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: Boolean
+        tags: *id007
+      - uuid: 2caf3319b0a042f1a36da22555461154
+        name: 'OCI FSS [{#FS.NAME}]: Snapshot policy configured'
+        type: DEPENDENT
+        key: oci.fss.fs.snapshot.policy["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.filesystemSnapshotPolicyId)?1:0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: Boolean
+        tags: *id007
+      - uuid: e20f22629d4b4cc38144ebecf3284ecb
+        name: 'OCI FSS [{#FS.NAME}]: Custom KMS key configured'
+        type: DEPENDENT
+        key: oci.fss.fs.kms.custom["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.kmsKeyId)?1:0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        valuemap:
+          name: Boolean
+        tags: *id007
+      - uuid: 5919c0b741e8475790d3c0bfc3f9a288
+        name: 'OCI FSS [{#FS.NAME}]: Clone count'
+        type: DEPENDENT
+        key: oci.fss.fs.clone.count["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.fs&&d.fs.cloneCount)||0;
+        master_item:
+          key: oci.fss.fs.details["{#FS.ID}"]
+        tags: *id007
+      - uuid: bdc14cf6c2be4620b983ed5e821c6192
+        name: 'OCI FSS [{#FS.NAME}]: Read throughput'
+        type: DEPENDENT
+        key: oci.fss.fs.read.throughput["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: Bps
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readThroughput']===undefined || o['readThroughput']===null) return 0; return o['readThroughput'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 1075910ffaf942b09abf0bf6b571548c
+        name: 'OCI FSS [{#FS.NAME}]: Write throughput'
+        type: DEPENDENT
+        key: oci.fss.fs.write.throughput["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: Bps
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeThroughput']===undefined || o['writeThroughput']===null) return 0; return o['writeThroughput'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 84deca5f696e4200821bc1bc00c57c26
+        name: 'OCI FSS [{#FS.NAME}]: READ requests/s (0-8 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.read.ops.0_8k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readOps_0B_to_8KiB']===undefined || o['readOps_0B_to_8KiB']===null) return 0; return o['readOps_0B_to_8KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: ea18fb908c7241aebb762c6343f2717d
+        name: 'OCI FSS [{#FS.NAME}]: READ latency (0-8 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.read.latency.0_8k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readLatency_0B_to_8KiB']===undefined || o['readLatency_0B_to_8KiB']===null) return 0; return o['readLatency_0B_to_8KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 20ccf6dc85f24dceaf6d01a5ba9297c9
+        name: 'OCI FSS [{#FS.NAME}]: WRITE requests/s (0-8 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.write.ops.0_8k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeOps_0B_to_8KiB']===undefined || o['writeOps_0B_to_8KiB']===null) return 0; return o['writeOps_0B_to_8KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 052b4797667941b288e7263b86ea4e51
+        name: 'OCI FSS [{#FS.NAME}]: WRITE latency (0-8 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.write.latency.0_8k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeLatency_0B_to_8KiB']===undefined || o['writeLatency_0B_to_8KiB']===null) return 0; return o['writeLatency_0B_to_8KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 2440b37563d948b3b15fe4c6d2bf8e4e
+        name: 'OCI FSS [{#FS.NAME}]: READ requests/s (8-64 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.read.ops.8_64k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readOps_8KiB_to_64KiB']===undefined || o['readOps_8KiB_to_64KiB']===null) return 0; return o['readOps_8KiB_to_64KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 65d13adb0fea4e4eb92a9c89c311e1f5
+        name: 'OCI FSS [{#FS.NAME}]: READ latency (8-64 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.read.latency.8_64k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readLatency_8KiB_to_64KiB']===undefined || o['readLatency_8KiB_to_64KiB']===null) return 0; return o['readLatency_8KiB_to_64KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: bc5b7c03c8094eaf9214bdb897fa7c8e
+        name: 'OCI FSS [{#FS.NAME}]: WRITE requests/s (8-64 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.write.ops.8_64k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeOps_8KiB_to_64KiB']===undefined || o['writeOps_8KiB_to_64KiB']===null) return 0; return o['writeOps_8KiB_to_64KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 404ef2a5f0014fffb1de2244d2212f7a
+        name: 'OCI FSS [{#FS.NAME}]: WRITE latency (8-64 KiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.write.latency.8_64k["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeLatency_8KiB_to_64KiB']===undefined || o['writeLatency_8KiB_to_64KiB']===null) return 0; return o['writeLatency_8KiB_to_64KiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 472d0aab6e8f4762a38a006f7ac78568
+        name: 'OCI FSS [{#FS.NAME}]: READ requests/s (64 KiB-1 MiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.read.ops.64k_1m["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readOps_64KiB_to_1MiB']===undefined || o['readOps_64KiB_to_1MiB']===null) return 0; return o['readOps_64KiB_to_1MiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: da028eb268be4209a89a7a18ff92c048
+        name: 'OCI FSS [{#FS.NAME}]: READ latency (64 KiB-1 MiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.read.latency.64k_1m["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['readLatency_64KiB_to_1MiB']===undefined || o['readLatency_64KiB_to_1MiB']===null) return 0; return o['readLatency_64KiB_to_1MiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: eca9af1c282e4b92a277560ad18eb3b6
+        name: 'OCI FSS [{#FS.NAME}]: WRITE requests/s (64 KiB-1 MiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.write.ops.64k_1m["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeOps_64KiB_to_1MiB']===undefined || o['writeOps_64KiB_to_1MiB']===null) return 0; return o['writeOps_64KiB_to_1MiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 4386993f5cbd41e4984442d9f0a9a551
+        name: 'OCI FSS [{#FS.NAME}]: WRITE latency (64 KiB-1 MiB)'
+        type: DEPENDENT
+        key: oci.fss.fs.write.latency.64k_1m["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['writeLatency_64KiB_to_1MiB']===undefined || o['writeLatency_64KiB_to_1MiB']===null) return 0; return o['writeLatency_64KiB_to_1MiB'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 4e9e89b4497d4cc0823357ea41ded45f
+        name: 'OCI FSS [{#FS.NAME}]: Worst READ latency'
+        type: DEPENDENT
+        key: oci.fss.fs.read.latency.worst["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),o=d.fs&&d.fs['{#FS.ID}']; if(!o)return 0; var f=["readLatency_0B_to_8KiB", "readLatency_8KiB_to_64KiB", "readLatency_64KiB_to_1MiB"],m=null; for(var i=0;i<f.length;i++){var v=o[f[i]];if(v!==undefined&&v!==null&&(m===null||Number(v)>m))m=Number(v);} return m===null?0:m;
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+        triggers:
+        - uuid: a07c3d9e133f48aca9ac9167dd626991
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.read.latency.worst["{#FS.ID}"],15m)>={$OCI.FSS.LATENCY.WARN}
+            and avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.read.latency.worst["{#FS.ID}"],15m)<{$OCI.FSS.LATENCY.CRIT}
+          name: 'OCI FSS [{#FS.NAME}]: READ latency is high'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: performance
+        - uuid: ee5e52d265ab456090feaa2fcb52f508
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.read.latency.worst["{#FS.ID}"],15m)>={$OCI.FSS.LATENCY.CRIT}
+          name: 'OCI FSS [{#FS.NAME}]: READ latency is critical'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: performance
+      - uuid: d8aa2098212c47a1a79862b0078b3a9f
+        name: 'OCI FSS [{#FS.NAME}]: Worst WRITE latency'
+        type: DEPENDENT
+        key: oci.fss.fs.write.latency.worst["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),o=d.fs&&d.fs['{#FS.ID}']; if(!o)return 0; var f=["writeLatency_0B_to_8KiB", "writeLatency_8KiB_to_64KiB", "writeLatency_64KiB_to_1MiB"],m=null; for(var i=0;i<f.length;i++){var v=o[f[i]];if(v!==undefined&&v!==null&&(m===null||Number(v)>m))m=Number(v);} return m===null?0:m;
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+        triggers:
+        - uuid: 817c47062f364d1a9252b018ad890670
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.write.latency.worst["{#FS.ID}"],15m)>={$OCI.FSS.LATENCY.WARN}
+            and avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.write.latency.worst["{#FS.ID}"],15m)<{$OCI.FSS.LATENCY.CRIT}
+          name: 'OCI FSS [{#FS.NAME}]: WRITE latency is high'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: performance
+        - uuid: a39412df0e3a4dc68299a64efcac3830
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.write.latency.worst["{#FS.ID}"],15m)>={$OCI.FSS.LATENCY.CRIT}
+          name: 'OCI FSS [{#FS.NAME}]: WRITE latency is critical'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: performance
+      - uuid: 8d779d4b940046468c6a1dbcbb4eaed5
+        name: 'OCI FSS [{#FS.NAME}]: Metadata IOPS CREATE'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.iops.create["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaIops_CREATE']===undefined || o['metaIops_CREATE']===null) return 0; return o['metaIops_CREATE'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 55e27441f61743158115e7a3c8b9db59
+        name: 'OCI FSS [{#FS.NAME}]: Metadata latency CREATE'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.latency.create["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaLatency_CREATE']===undefined || o['metaLatency_CREATE']===null) return 0; return o['metaLatency_CREATE'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 85c4775d8ace40c68fa26d4431c8e83f
+        name: 'OCI FSS [{#FS.NAME}]: Metadata IOPS GETATTR'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.iops.getattr["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaIops_GETATTR']===undefined || o['metaIops_GETATTR']===null) return 0; return o['metaIops_GETATTR'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: b8be24ba19dd41deb90d4d8c6540f3ae
+        name: 'OCI FSS [{#FS.NAME}]: Metadata latency GETATTR'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.latency.getattr["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaLatency_GETATTR']===undefined || o['metaLatency_GETATTR']===null) return 0; return o['metaLatency_GETATTR'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: a5ffcd80d4184f699ffb2b48b80309ac
+        name: 'OCI FSS [{#FS.NAME}]: Metadata IOPS SETATTR'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.iops.setattr["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaIops_SETATTR']===undefined || o['metaIops_SETATTR']===null) return 0; return o['metaIops_SETATTR'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 9f89ed7293ef46ffbedd3cbaefc83cab
+        name: 'OCI FSS [{#FS.NAME}]: Metadata latency SETATTR'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.latency.setattr["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaLatency_SETATTR']===undefined || o['metaLatency_SETATTR']===null) return 0; return o['metaLatency_SETATTR'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 2e4068af35a1419196e6480d4ffa0bd1
+        name: 'OCI FSS [{#FS.NAME}]: Metadata IOPS REMOVE'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.iops.remove["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: ops
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaIops_REMOVE']===undefined || o['metaIops_REMOVE']===null) return 0; return o['metaIops_REMOVE'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 23e02d967e0441b78366c6d5454149b2
+        name: 'OCI FSS [{#FS.NAME}]: Metadata latency REMOVE'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.latency.remove["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['metaLatency_REMOVE']===undefined || o['metaLatency_REMOVE']===null) return 0; return o['metaLatency_REMOVE'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+      - uuid: 8854e93b7a1641b3922ef9779934c4a7
+        name: 'OCI FSS [{#FS.NAME}]: Worst metadata latency'
+        type: DEPENDENT
+        key: oci.fss.fs.meta.latency.worst["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: s
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),o=d.fs&&d.fs['{#FS.ID}']; if(!o)return 0; var f=["metaLatency_CREATE", "metaLatency_GETATTR", "metaLatency_SETATTR", "metaLatency_REMOVE"],m=null; for(var i=0;i<f.length;i++){var v=o[f[i]];if(v!==undefined&&v!==null&&(m===null||Number(v)>m))m=Number(v);} return m===null?0:m;
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id007
+        triggers:
+        - uuid: 8dcf996c23cc4ca3afa5f6a87724ff50
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.fs.meta.latency.worst["{#FS.ID}"],15m)>={$OCI.FSS.METADATA.LATENCY.WARN}
+          name: 'OCI FSS [{#FS.NAME}]: Metadata latency is high'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: performance
+      - uuid: 3a717dbfbd4c4298b0263d13b239ada1
+        name: 'OCI FSS [{#FS.NAME}]: Monitoring usage'
+        type: DEPENDENT
+        key: oci.fss.fs.metric.usage["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: B
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['usage']===undefined || o['usage']===null) return 0; return o['usage'];
+        master_item:
+          key: oci.fss.metrics.slow.raw
+        tags: *id007
+      - uuid: 7b26fe582c464ee7b856cb830e5626c8
+        name: 'OCI FSS [{#FS.NAME}]: Soft quota violations'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.soft.violations["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['softViolations']===undefined || o['softViolations']===null) return 0; return o['softViolations'];
+        master_item:
+          key: oci.fss.metrics.slow.raw
+        tags: *id007
+        triggers:
+        - uuid: 5ba572d9baf34581bf99dfbd7c387161
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.soft.violations["{#FS.ID}"])>0
+          name: 'OCI FSS [{#FS.NAME}]: Soft quota violations detected'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: capacity
+      - uuid: 1e14a16642fe4d799f1f625aad2fb416
+        name: 'OCI FSS [{#FS.NAME}]: Hard quota violations'
+        type: DEPENDENT
+        key: oci.fss.fs.quota.hard.violations["{#FS.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.fs && d.fs['{#FS.ID}']; if(!o || o['hardViolations']===undefined || o['hardViolations']===null) return 0; return o['hardViolations'];
+        master_item:
+          key: oci.fss.metrics.slow.raw
+        tags: *id007
+        triggers:
+        - uuid: 686a307845d74c05a54d8f29e80bd0fd
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.fs.quota.hard.violations["{#FS.ID}"])>0
+          name: 'OCI FSS [{#FS.NAME}]: Hard quota violations detected'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id004
+          - *id005
+          - *id006
+          - tag: scope
+            value: capacity
+      graph_prototypes:
+      - uuid: 8a1e1dc8c91d49f1897a6ffd0a6e6fa5
+        name: 'OCI FSS [{#FS.NAME}]: Throughput'
+        graph_items:
+        - color: 199C0D
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.read.throughput["{#FS.ID}"]
+        - sortorder: '1'
+          color: F63100
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.write.throughput["{#FS.ID}"]
+      - uuid: fd2297525ed143cea4f5be533b9fa542
+        name: 'OCI FSS [{#FS.NAME}]: Latency'
+        graph_items:
+        - color: 199C0D
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.read.latency.worst["{#FS.ID}"]
+        - sortorder: '1'
+          color: F63100
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.write.latency.worst["{#FS.ID}"]
+        - sortorder: '2'
+          color: 00611C
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.meta.latency.worst["{#FS.ID}"]
+      - uuid: 6ce1e3d697634602a271e45093ff6177
+        name: 'OCI FSS [{#FS.NAME}]: Capacity and quotas'
+        graph_items:
+        - color: 199C0D
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.metered.bytes["{#FS.ID}"]
+        - sortorder: '1'
+          color: F63100
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.quota.hard.limit["{#FS.ID}"]
+        - sortorder: '2'
+          color: 00611C
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.fs.quota.soft.limit["{#FS.ID}"]
+      master_item:
+        key: oci.fss.discovery.raw
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return JSON.stringify(d.filesystems||[]);
+    - uuid: 602bec045857478ea85f83b12e39970d
+      name: OCI FSS mount targets discovery
+      type: DEPENDENT
+      key: oci.fss.mounttargets.discovery
+      delay: '0'
+      filter:
+        evaltype: AND
+        conditions:
+        - macro: '{#MT.NAME}'
+          value: '{$OCI.FSS.MT.NAME.MATCHES}'
+          formulaid: A
+        - macro: '{#MT.NAME}'
+          value: '{$OCI.FSS.MT.NAME.NOT_MATCHES}'
+          operator: NOT_MATCHES_REGEX
+          formulaid: B
+      lifetime: 30d
+      lifetime_type: DELETE_AFTER
+      enabled_lifetime: 1d
+      enabled_lifetime_type: DISABLE_AFTER
+      item_prototypes:
+      - uuid: 57098a8f5bd942feaf4bd2f2e45a1831
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Details raw'
+        type: SCRIPT
+        key: oci.fss.mt.details["{#MT.ID}"]
+        delay: 15m
+        history: '0'
+        value_type: TEXT
+        trends: '0'
+        params: |
+          function CTlsConfig(raw) {
+              raw = String(raw || 'full').trim().toLowerCase();
+              if (['none','peer','full'].indexOf(raw) === -1) raw = 'full';
+              this.options = {
+                  SSLVerifyPeer: (raw === 'peer' || raw === 'full'),
+                  SSLVerifyHost: (raw === 'full')
+              };
+          }
+          function validate(required, p) {
+              for (var i = 0; i < required.length; i++) {
+                  if (typeof p[required[i]] === 'undefined' || p[required[i]] === '')
+                      throw 'Required parameter is not set: ' + required[i];
+              }
+          }
+          function OCI(params) {
+              this.req = new HttpRequest((new CTlsConfig(params.tls_verify)).options);
+              if (params.http_proxy) this.req.setProxy(params.http_proxy);
+              this.hash = function(s) { return sha256(s); };
+              this.sign = function(s) { return sign('sha256', params.private_key, s); };
+              this.encode = function(hash) {
+                  var hexArr = hash.match(/.{1,2}/g), a = new Uint8Array(hexArr.length);
+                  hexArr.forEach(function(h, i) { a[i] = parseInt(h, 16); });
+                  return btoa(a);
+              };
+              this.date = function() {
+                  var wd=['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+                  var mo=['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+                  var d=new Date();
+                  function p(n){return n<10?'0'+n:String(n);}
+                  return wd[d.getUTCDay()]+', '+p(d.getUTCDate())+' '+mo[d.getUTCMonth()]+' '+d.getUTCFullYear()+' '+p(d.getUTCHours())+':'+p(d.getUTCMinutes())+':'+p(d.getUTCSeconds())+' GMT';
+              };
+              this.call = function(method, host, path, query, bodyObj) {
+                  method = method.toLowerCase(); query = query || '';
+                  var body = bodyObj === null || typeof bodyObj === 'undefined' ? '' : JSON.stringify(bodyObj);
+                  var attempt=0, response='', status=0, headersObj={};
+                  while (attempt < 4) {
+                      attempt++;
+                      this.req.clearHeader();
+                      var signed='(request-target) date host';
+                      var dateHeader='date: '+this.date();
+                      var hostHeader='host: '+host;
+                      var target='(request-target): '+method+' '+path+query;
+                      var signing=target+'\n'+dateHeader+'\n'+hostHeader;
+                      var reqHeaders=['content-type: application/json', dateHeader];
+                      if (method !== 'get' && method !== 'head') {
+                          signed += ' x-content-sha256 content-type content-length';
+                          var hashHeader='x-content-sha256: '+this.encode(this.hash(body));
+                          var lenHeader='content-length: '+body.length;
+                          signing += '\n'+hashHeader+'\ncontent-type: application/json\n'+lenHeader;
+                          reqHeaders.push(hashHeader, lenHeader);
+                      }
+                      var signature=this.encode(this.sign(signing));
+                      reqHeaders.push('Authorization: Signature version="1",keyId="'+params.tenancy_ocid+'/'+params.user_ocid+'/'+params.fingerprint+'",algorithm="rsa-sha256",headers="'+signed+'",signature="'+signature+'"');
+                      for (var h=0;h<reqHeaders.length;h++) this.req.addHeader(reqHeaders[h]);
+                      var url='https://'+host+path+query;
+                      response = method === 'get' ? this.req.get(url) : this.req.post(url, body);
+                      status=this.req.getStatus(); headersObj=this.req.getHeaders(false) || {};
+                      if (status !== 429 && status < 500) break;
+                      Zabbix.sleep(attempt * 500);
+                  }
+                  this.req.clearHeader();
+                  if (status < 200 || status >= 300) {
+                      var msg=response;
+                      try { var e=JSON.parse(response); msg=e.message || e.code || response; } catch(ignore) {}
+                      throw host+path+query+' returned HTTP '+status+': '+msg;
+                  }
+                  return {body:response, headers:headersObj, status:status};
+              };
+          }
+          function headerValue(headers, wanted) {
+              wanted=String(wanted).toLowerCase();
+              for (var k in headers) if (String(k).toLowerCase() === wanted) {
+                  var v=headers[k]; return Array.isArray(v) ? (v.length ? v[0] : '') : v;
+              }
+              return '';
+          }
+          function endpoint(params, kind) {
+              var ov=params[kind+'_host'];
+              if (ov) return ov.replace(/^https?:\/\//i,'').replace(/\/$/,'');
+              var r=params.region, dom=params.realm_domain || 'oraclecloud.com';
+              if (kind === 'search') return 'query.'+r+'.oci.'+dom;
+              if (kind === 'file') return 'filestorage.'+r+'.'+dom;
+              if (kind === 'telemetry') return 'telemetry.'+r+'.'+dom;
+              if (kind === 'core') return 'iaas.'+r+'.'+dom;
+              throw 'Unknown endpoint kind: '+kind;
+          }
+
+          var out={status:0,error:'',ipError:'',mountTarget:{},privateIps:[]};
+          try {
+              var p=JSON.parse(value); validate(['tenancy_ocid','user_ocid','fingerprint','private_key','region','mt_id'],p);
+              var oci=new OCI(p), fh=endpoint(p,'file');
+              out.mountTarget=JSON.parse(oci.call('get',fh,'/20171215/mountTargets/'+p.mt_id,'',null).body);
+              if (String(p.resolve_private_ip) === '1') {
+                  try {
+                      var ch=endpoint(p,'core'), ids=out.mountTarget.privateIpIds || [];
+                      for (var i=0;i<ids.length;i++) out.privateIps.push(JSON.parse(oci.call('get',ch,'/20160918/privateIps/'+ids[i],'',null).body));
+                  } catch(ie){out.ipError=String(ie);}
+              }
+              out.status=1;
+          } catch(e){out.error=String(e); Zabbix.log(3,'[ OCI FSS mount target details ] '+out.error);}
+          return JSON.stringify(out);
+        timeout: 30s
+        parameters:
+        - name: tenancy_ocid
+          value: '{$OCI.API.TENANCY}'
+        - name: user_ocid
+          value: '{$OCI.API.USER}'
+        - name: fingerprint
+          value: '{$OCI.API.FINGERPRINT}'
+        - name: private_key
+          value: '{$OCI.API.PRIVATE.KEY}'
+        - name: region
+          value: '{$OCI.FSS.REGION}'
+        - name: realm_domain
+          value: '{$OCI.FSS.REALM.DOMAIN}'
+        - name: search_host
+          value: '{$OCI.FSS.SEARCH.HOST}'
+        - name: file_host
+          value: '{$OCI.FSS.FILE.HOST}'
+        - name: telemetry_host
+          value: '{$OCI.FSS.TELEMETRY.HOST}'
+        - name: core_host
+          value: '{$OCI.FSS.CORE.HOST}'
+        - name: http_proxy
+          value: '{$OCI.HTTP.PROXY}'
+        - name: tls_verify
+          value: '{$OCI.FSS.TLS.VERIFY}'
+        - name: mt_id
+          value: '{#MT.ID}'
+        - name: resolve_private_ip
+          value: '{$OCI.FSS.RESOLVE.PRIVATE.IP}'
+        tags:
+        - *id001
+        - &id008
+          tag: oci.resource
+          value: mounttarget
+        - &id009
+          tag: oci.mounttarget
+          value: '{#MT.NAME}'
+        - &id010
+          tag: oci.compartment
+          value: '{#MT.COMPARTMENT}'
+        - tag: scope
+          value: raw
+      - uuid: 3ebcae0dbbe7465abd552ea76468e376
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: API status'
+        type: DEPENDENT
+        key: oci.fss.mt.api.status["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return d.status||0;
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        valuemap:
+          name: OCI API status
+        tags: &id011
+        - *id001
+        - *id008
+        - *id009
+        - *id010
+        triggers:
+        - uuid: 8eea6eed8b9341c48f377105bd92b191
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.mt.api.status["{#MT.ID}"]) = 0
+          name: 'OCI FSS Mount Target [{#MT.NAME}]: API unavailable'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id008
+          - *id009
+          - *id010
+          - tag: scope
+            value: availability
+      - uuid: 60b43d10c8f447eba7ba79617dba9dae
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Lifecycle state'
+        type: DEPENDENT
+        key: oci.fss.mt.state["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),s=(d.mountTarget&&d.mountTarget.lifecycleState)||'UNKNOWN';var m={CREATING:0,ACTIVE:1,UPDATING:2,DELETING:3,DELETED:4,FAILED:5};return m[s]===undefined?99:m[s];
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        valuemap:
+          name: OCI FSS lifecycle state
+        tags: *id011
+        triggers:
+        - uuid: 217d04ac4d664643b5c388531428abd0
+          expression: last(/Oracle OCI File Storage by HTTP/oci.fss.mt.state["{#MT.ID}"]) = 5
+          name: 'OCI FSS Mount Target [{#MT.NAME}]: Lifecycle FAILED'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id008
+          - *id009
+          - *id010
+          - tag: scope
+            value: availability
+      - uuid: a481a28aa3b94050b5c7cd0ac1a970f0
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Lifecycle details'
+        type: DEPENDENT
+        key: oci.fss.mt.state.details["{#MT.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.mountTarget&&d.mountTarget.lifecycleDetails)||'';
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: aedb496f8f0848619634a290192a1403
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Primary private IP'
+        type: DEPENDENT
+        key: oci.fss.mt.ip["{#MT.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: CHAR
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.privateIps||[];return a.length?(a[0].ipAddress||''):'';
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 25c46163929142ddb46e204912900ef2
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Private IPs'
+        type: DEPENDENT
+        key: oci.fss.mt.ips["{#MT.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.privateIps||[],o=[];for(var i=0;i<a.length;i++)o.push(a[i].ipAddress||'');return o.join(', ');
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 32b3fad3366d44769cfe4c363b4757bf
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Hostname labels'
+        type: DEPENDENT
+        key: oci.fss.mt.hostnames["{#MT.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=d.privateIps||[],o=[];for(var i=0;i<a.length;i++)if(a[i].hostnameLabel)o.push(a[i].hostnameLabel);return o.join(', ');
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1h
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 71bb0b834c4845a585c73f1fb21856f1
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Export set OCID'
+        type: DEPENDENT
+        key: oci.fss.mt.exportset["{#MT.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: TEXT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.mountTarget&&d.mountTarget.exportSetId)||'';
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1d
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: c911578564e24f2c8f863339c419e857
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: NSG count'
+        type: DEPENDENT
+        key: oci.fss.mt.nsg.count["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value),a=(d.mountTarget&&d.mountTarget.nsgIds)||[];return a.length;
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 77f5e27ebc014f938db1ca0e87fb99db
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Observed throughput capacity'
+        type: DEPENDENT
+        key: oci.fss.mt.observed.gbps["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: Gbps
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.mountTarget&&d.mountTarget.observedThroughput)||0;
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 0772f75e41ec4298a3fc063fe5bd65f5
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Requested throughput capacity'
+        type: DEPENDENT
+        key: oci.fss.mt.requested.gbps["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: Gbps
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.mountTarget&&d.mountTarget.requestedThroughput)||0;
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 9da1fc468bbe4ed29f1edb1164840206
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Reserved storage capacity'
+        type: DEPENDENT
+        key: oci.fss.mt.reserved.gb["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: GB
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.mountTarget&&d.mountTarget.reservedStorageCapacity)||0;
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 99373bb8bc8d428d97b083efe08431d4
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: ID mapping type'
+        type: DEPENDENT
+        key: oci.fss.mt.idmap["{#MT.ID}"]
+        delay: '0'
+        history: 1d
+        trends: '0'
+        value_type: CHAR
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value);return (d.mountTarget&&d.mountTarget.idmapType)||'NONE';
+        - type: DISCARD_UNCHANGED_HEARTBEAT
+          parameters:
+          - 1d
+        master_item:
+          key: oci.fss.mt.details["{#MT.ID}"]
+        tags: *id011
+      - uuid: 0edfd3acdbbd48d58b3e82d385d5c4e8
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Read throughput'
+        type: DEPENDENT
+        key: oci.fss.mt.read.throughput["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: Bps
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.mt && d.mt['{#MT.ID}']; if(!o || o['readThroughput']===undefined || o['readThroughput']===null) return 0; return o['readThroughput'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id011
+      - uuid: ee50ede7e5a0405597199250dcb032be
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Write throughput'
+        type: DEPENDENT
+        key: oci.fss.mt.write.throughput["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: Bps
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.mt && d.mt['{#MT.ID}']; if(!o || o['writeThroughput']===undefined || o['writeThroughput']===null) return 0; return o['writeThroughput'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id011
+      - uuid: 154ef755b4504131a9ad2466528ad1ea
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Client connections'
+        type: DEPENDENT
+        key: oci.fss.mt.connections["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.mt && d.mt['{#MT.ID}']; if(!o || o['connections']===undefined || o['connections']===null) return 0; return o['connections'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id011
+      - uuid: 5b321df24a334db4bbe0051024fbac74
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Health success rate'
+        type: DEPENDENT
+        key: oci.fss.mt.health.success["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: '%'
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.mt && d.mt['{#MT.ID}']; if(!o || o['health_SuccessRate']===undefined || o['health_SuccessRate']===null) return 100; return o['health_SuccessRate'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id011
+        triggers:
+        - uuid: 846580617b07451fa8e44c2ff201dea7
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.mt.health.success["{#MT.ID}"],15m)<{$OCI.FSS.MT.HEALTH.WARN}
+            and avg(/Oracle OCI File Storage by HTTP/oci.fss.mt.health.success["{#MT.ID}"],15m)>={$OCI.FSS.MT.HEALTH.CRIT}
+          name: 'OCI FSS Mount Target [{#MT.NAME}]: Health degraded'
+          priority: WARNING
+          tags:
+          - *id001
+          - *id008
+          - *id009
+          - *id010
+          - tag: scope
+            value: availability
+        - uuid: 7eacda69a7444bb98e1c5caf768c6c13
+          expression: avg(/Oracle OCI File Storage by HTTP/oci.fss.mt.health.success["{#MT.ID}"],15m)<{$OCI.FSS.MT.HEALTH.CRIT}
+          name: 'OCI FSS Mount Target [{#MT.NAME}]: Health critically degraded'
+          priority: HIGH
+          tags:
+          - *id001
+          - *id008
+          - *id009
+          - *id010
+          - tag: scope
+            value: availability
+      - uuid: e30383f8f6dd4bb7849580df24bca630
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Health error rate'
+        type: DEPENDENT
+        key: oci.fss.mt.health.error["{#MT.ID}"]
+        delay: '0'
+        history: 14d
+        trends: 365d
+        value_type: FLOAT
+        units: '%'
+        preprocessing:
+        - type: JAVASCRIPT
+          parameters:
+          - |-
+            var d=JSON.parse(value), o=d.mt && d.mt['{#MT.ID}']; if(!o || o['health_ErrorRate']===undefined || o['health_ErrorRate']===null) return 0; return o['health_ErrorRate'];
+        master_item:
+          key: oci.fss.metrics.fast.raw
+        tags: *id011
+      graph_prototypes:
+      - uuid: 5d21f330c911473d88a6db77187504af
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Throughput'
+        graph_items:
+        - color: 199C0D
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.mt.read.throughput["{#MT.ID}"]
+        - sortorder: '1'
+          color: F63100
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.mt.write.throughput["{#MT.ID}"]
+      - uuid: 5335040faf66411eadcc27e17c3729d7
+        name: 'OCI FSS Mount Target [{#MT.NAME}]: Health and connections'
+        graph_items:
+        - color: 199C0D
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.mt.health.success["{#MT.ID}"]
+        - sortorder: '1'
+          color: F63100
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.mt.health.error["{#MT.ID}"]
+        - sortorder: '2'
+          color: 00611C
+          yaxisside: RIGHT
+          item:
+            host: Oracle OCI File Storage by HTTP
+            key: oci.fss.mt.connections["{#MT.ID}"]
+      master_item:
+        key: oci.fss.discovery.raw
+      preprocessing:
+      - type: JAVASCRIPT
+        parameters:
+        - |-
+          var d=JSON.parse(value);return JSON.stringify(d.mounttargets||[]);
+    macros:
+    - macro: '{$OCI.API.TENANCY}'
+      description: OCI tenancy OCID. Same macro used by the official Oracle Cloud by HTTP template.
+    - macro: '{$OCI.API.USER}'
+      description: OCI API user OCID. Same macro used by the official Oracle Cloud by HTTP template.
+    - macro: '{$OCI.API.FINGERPRINT}'
+      type: SECRET_TEXT
+      description: Fingerprint of the OCI API signing key.
+    - macro: '{$OCI.API.PRIVATE.KEY}'
+      type: SECRET_TEXT
+      description: Entire PEM private key used for OCI API request signing.
+    - macro: '{$OCI.FSS.REGION}'
+      value: eu-milan-1
+      description: OCI region monitored by this host. Resource Search is region-scoped.
+    - macro: '{$OCI.FSS.REALM.DOMAIN}'
+      value: oraclecloud.com
+      description: OCI realm domain. For commercial OC1 use oraclecloud.com.
+    - macro: '{$OCI.FSS.SEARCH.HOST}'
+      value: ''
+      description: Optional Resource Search endpoint override, without https://. Empty = query.<region>.oci.<realm-domain>.
+    - macro: '{$OCI.FSS.FILE.HOST}'
+      value: ''
+      description: Optional File Storage API endpoint override, without https://. Empty = filestorage.<region>.<realm-domain>.
+    - macro: '{$OCI.FSS.TELEMETRY.HOST}'
+      value: ''
+      description: Optional Monitoring API endpoint override. Empty = telemetry.<region>.<realm-domain>.
+    - macro: '{$OCI.FSS.CORE.HOST}'
+      value: ''
+      description: Optional Core API endpoint override. Empty = iaas.<region>.<realm-domain>.
+    - macro: '{$OCI.HTTP.PROXY}'
+      value: ''
+      description: Optional HTTP proxy used for all OCI API calls.
+    - macro: '{$OCI.FSS.TLS.VERIFY}'
+      value: full
+      description: 'TLS validation mode: full, peer or none.'
+    - macro: '{$OCI.FSS.RESOLVE.PRIVATE.IP}'
+      value: '1'
+      description: Resolve mount target privateIpIds through the OCI Core API. Set 0 if the API user cannot read private IP
+        resources.
+    - macro: '{$OCI.FSS.FS.NAME.MATCHES}'
+      value: .*
+      description: Regex of File System display names to discover.
+    - macro: '{$OCI.FSS.FS.NAME.NOT_MATCHES}'
+      value: CHANGE_IF_NEEDED
+      description: Regex of File System names to exclude.
+    - macro: '{$OCI.FSS.MT.NAME.MATCHES}'
+      value: .*
+      description: Regex of Mount Target display names to discover.
+    - macro: '{$OCI.FSS.MT.NAME.NOT_MATCHES}'
+      value: CHANGE_IF_NEEDED
+      description: Regex of Mount Target names to exclude.
+    - macro: '{$OCI.FSS.QUOTA.WARN}'
+      value: '85'
+      description: Warning threshold for FILE_SYSTEM_LEVEL hard quota usage, percent.
+    - macro: '{$OCI.FSS.QUOTA.CRIT}'
+      value: '95'
+      description: High threshold for FILE_SYSTEM_LEVEL hard quota usage, percent.
+    - macro: '{$OCI.FSS.LATENCY.WARN}'
+      value: '0.05'
+      description: Warning threshold for sustained file-system READ/WRITE latency, seconds.
+    - macro: '{$OCI.FSS.LATENCY.CRIT}'
+      value: '0.1'
+      description: High threshold for sustained file-system READ/WRITE latency, seconds.
+    - macro: '{$OCI.FSS.METADATA.LATENCY.WARN}'
+      value: '0.05'
+      description: Warning threshold for sustained metadata latency, seconds.
+    - macro: '{$OCI.FSS.MT.HEALTH.WARN}'
+      value: '99'
+      description: Mount Target health warning threshold, percent successful requests.
+    - macro: '{$OCI.FSS.MT.HEALTH.CRIT}'
+      value: '95'
+      description: Mount Target health high threshold, percent successful requests.
+    valuemaps:
+    - uuid: e4fbc1d8423144a49538faec520bd579
+      name: OCI API status
+      mappings:
+      - value: '0'
+        newvalue: Failed
+      - value: '1'
+        newvalue: Up
+    - uuid: 759d3160f319461b8fa341d49fdf8dcf
+      name: Boolean
+      mappings:
+      - value: '0'
+        newvalue: 'No'
+      - value: '1'
+        newvalue: 'Yes'
+    - uuid: 3a9575f41c2b448ab6bc34de01fbbb2d
+      name: OCI FSS lifecycle state
+      mappings:
+      - value: '0'
+        newvalue: CREATING
+      - value: '1'
+        newvalue: ACTIVE
+      - value: '2'
+        newvalue: UPDATING
+      - value: '3'
+        newvalue: DELETING
+      - value: '4'
+        newvalue: DELETED
+      - value: '5'
+        newvalue: FAILED
+      - value: '99'
+        newvalue: UNKNOWN
+    - uuid: 6ca953d0f7274b7ab4d3cbbf78eadefd
+      name: OCI FSS quota enforcement state
+      mappings:
+      - value: '0'
+        newvalue: DISABLED
+      - value: '1'
+        newvalue: ENABLING
+      - value: '2'
+        newvalue: ENABLED
+      - value: '3'
+        newvalue: DISABLING
+      - value: '4'
+        newvalue: SYNCING
+      - value: '5'
+        newvalue: FAILED
+      - value: '99'
+        newvalue: UNKNOWN
